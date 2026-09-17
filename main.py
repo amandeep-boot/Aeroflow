@@ -1,124 +1,131 @@
-import time
+"""
+main.py
+=======
+Bol Radha Bol — bootstrap & dependency injection entry point.
+
+This module:
+  1. Validates configuration (API key present, correct OS, etc.)
+  2. Instantiates the platform-specific adapters
+  3. Wires them into the DictationOrchestrator (dependency injection)
+  4. Starts the hotkey listener and blocks until the user exits
+"""
+
+from __future__ import annotations
+
+import logging
+import platform
 import sys
-import ctypes
-from ctypes import wintypes
 
-# ---- Win32 SendInput Setup ----
-INPUT_KEYBOARD = 1
-KEYEVENTF_UNICODE = 0x0004
-KEYEVENTF_KEYUP = 0x0002
+import config  # noqa: F401 — loads .env as a side effect
 
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [
-        ("wVk", wintypes.WORD),
-        ("wScan", wintypes.WORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_ulonglong),
-    ]
+# Configure logging before any other imports
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 
-class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [
-        ("dx", wintypes.LONG),
-        ("dy", wintypes.LONG),
-        ("mouseData", wintypes.DWORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_ulonglong),
-    ]
+# ---------------------------------------------------------------------------
+# Platform guard
+# ---------------------------------------------------------------------------
+
+def _check_platform() -> None:
+    system = platform.system()
+    if system != "Windows":
+        logger.error(
+            "Bol Radha Bol currently only supports Windows. "
+            "Detected OS: %s. Linux support is planned for Phase 4.",
+            system,
+        )
+        sys.exit(1)
 
 
-class HARDWAREINPUT(ctypes.Structure):
-    _fields_ = [
-        ("uMsg", wintypes.DWORD),
-        ("wParamL", wintypes.WORD),
-        ("wParamH", wintypes.WORD),
-    ]
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def _validate_config() -> None:
+    if not config.GROQ_API_KEY:
+        logger.error(
+            "GROQ_API_KEY is not set.\n"
+            "  → Add it to your .env file:  GROQ_API_KEY=gsk_...\n"
+            "  → Or set the environment variable before running."
+        )
+        sys.exit(1)
 
 
-class _INPUTunion(ctypes.Union):
-    _fields_ = [
-        ("mi", MOUSEINPUT),
-        ("ki", KEYBDINPUT),
-        ("hi", HARDWAREINPUT),
-    ]
+# ---------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------
 
+def main() -> None:
+    print("=" * 60)
+    print("🎙️   Bol Radha Bol — System-Wide Dictation Engine")
+    print("=" * 60)
 
-class INPUT(ctypes.Structure):
-    _anonymous_ = ("_input",)
-    _fields_ = [
-        ("type", wintypes.DWORD),
-        ("_input", _INPUTunion),
-    ]
+    _check_platform()
+    _validate_config()
 
+    # --- Import adapters (platform-specific) ----------------------------
+    from adapters.windows.audio_capture import WindowsAudioCapture
+    from adapters.windows.text_injector import WindowsTextInjector
+    from adapters.windows.hotkey_listener import WindowsHotkeyListener
+    from adapters.ai.cloud_engine import GroqCloudEngine
+    from adapters.ui.indicator import FloatingIndicator
+    from core.orchestrator import DictationOrchestrator
 
-SendInput = ctypes.windll.user32.SendInput
-SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
-SendInput.restype = wintypes.UINT
+    # --- Instantiate adapters -------------------------------------------
+    audio_capture = WindowsAudioCapture(
+        device_index=config.AUDIO_DEVICE_INDEX,
+    )
+    inference_engine = GroqCloudEngine(
+        api_key=config.GROQ_API_KEY,
+        stt_model=config.STT_MODEL,
+        llm_model=config.LLM_MODEL,
+        llm_enabled=config.LLM_ENABLED,
+    )
+    text_injector = WindowsTextInjector(
+        char_delay=config.CHAR_DELAY,
+    )
+    ui_indicator = FloatingIndicator(
+        margin=config.OVERLAY_MARGIN,
+        opacity=config.OVERLAY_OPACITY,
+    )
 
+    # --- Wire into orchestrator (dependency injection) ------------------
+    orchestrator = DictationOrchestrator(
+        audio_capture=audio_capture,
+        inference_engine=inference_engine,
+        text_injector=text_injector,
+        ui_indicator=ui_indicator,
+    )
 
-def type_text(text: str, delay: float = 0.02):
-    """Sends keystrokes to the active window using Windows SendInput API."""
-    for char in text:
-        # Encode as UTF-16LE to safely handle ASCII, symbols, and multi-byte emojis
-        utf16_bytes = char.encode("utf-16-le")
-        for i in range(0, len(utf16_bytes), 2):
-            code_unit = int.from_bytes(utf16_bytes[i:i + 2], byteorder="little")
+    # --- Hotkey listener ------------------------------------------------
+    hotkey_listener = WindowsHotkeyListener(
+        callback=orchestrator.toggle,
+        hotkeys=config.HOTKEYS,
+    )
 
-            inp_down = INPUT(
-                type=INPUT_KEYBOARD,
-                ki=KEYBDINPUT(
-                    wVk=0,
-                    wScan=code_unit,
-                    dwFlags=KEYEVENTF_UNICODE,
-                    time=0,
-                    dwExtraInfo=0,
-                ),
-            )
-            inp_up = INPUT(
-                type=INPUT_KEYBOARD,
-                ki=KEYBDINPUT(
-                    wVk=0,
-                    wScan=code_unit,
-                    dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                    time=0,
-                    dwExtraInfo=0,
-                ),
-            )
+    # --- Start ----------------------------------------------------------
+    print(f"\n🟢 Listening for global hotkey: {' | '.join(config.HOTKEYS)}")
+    print("   Press once → START recording")
+    print("   Press again → STOP & auto-type")
+    print("   Ctrl+C in this terminal → EXIT\n")
 
-            SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(INPUT))
-            SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(INPUT))
-            if delay:
-                time.sleep(delay)
-
-
-def main():
-    print("=" * 40)
-    print("🎙️  Bol Radha Bol - Dev Mode")
-    print("=" * 40)
-    print("Status: [IDLE] Ready.")
-    print("Press Ctrl+C to quit.\n")
+    ui_indicator.show_idle()
+    hotkey_listener.start()
 
     try:
-        while True:
-            cmd = input("Press [Enter] to test text injection (or 'q' to quit): ")
-            if cmd.strip().lower() == "q":
-                print("Exiting...")
-                break
-
-            print("⏳ Switch to Notepad or any text field! Typing in 3 seconds...")
-            for remaining in range(3, 0, -1):
-                print(f"   {remaining}...")
-                time.sleep(1)
-
-            print("⌨️  Typing now...")
-            type_text("Namaste! Bol Radha Bol is typing directly into your active window! 🚀\n")
-            print("✅ Injected!\n")
-
+        hotkey_listener.join()
     except KeyboardInterrupt:
-        print("\nExiting...")
+        print("\n🛑 Shutting down...")
+    finally:
+        hotkey_listener.stop()
+        audio_capture.stop()
+        ui_indicator.hide()
+        logger.info("Shutdown complete.")
 
 
 if __name__ == "__main__":
